@@ -222,6 +222,12 @@ def _build_keymap():
         pygame.K_HOME: "HOME",
         pygame.K_COMMA: ",", pygame.K_PERIOD: ".", pygame.K_SLASH: "/",
         pygame.K_SEMICOLON: ";", pygame.K_MINUS: "-", pygame.K_EQUALS: "=",
+        # The C64 cursor keys.  Host arrows are the joystick, so the cursor
+        # keys get their own host keys (PageUp/PageDown, Home already = HOME);
+        # chosen not to collide with any host key sent to the C64 matrix.
+        # On the real keyboard these are single keys (shift = the other
+        # direction); a game reads them as two distinct rows.
+        pygame.K_PAGEUP: "CRSR_UD", pygame.K_PAGEDOWN: "CRSR_LR",
     }
     for i in range(26):
         keymap[pygame.K_a + i] = chr(ord("A") + i)
