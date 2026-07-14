@@ -26,9 +26,11 @@ def test_lint_passes_on_the_real_tree():
     assert errors == [], "tools/lint.py failed:\n" + "\n".join(errors)
 
 
-def test_lint_frontend_ring_is_only_player():
+def test_lint_frontend_ring_is_viewer_modules():
     lint = _load_lint()
-    assert lint.FRONTEND_RING == {"player.py"}
+    # the viewer-facing modules that may use numpy/pygame; importing c64_re
+    # itself must never pull them in (these keep their imports lazy)
+    assert lint.FRONTEND_RING == {"player.py", "audio_sink.py"}
     assert set(lint.FRONTEND_ALLOWED) <= set(lint.KNOWN_OPTIONAL)
 
 

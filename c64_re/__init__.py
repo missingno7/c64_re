@@ -23,5 +23,5 @@ __all__ = [
     # the lifter
     "lift",
     # frontend ring + tools support
-    "player", "pngout", "dis6502", "testing",
+    "player", "audio_sink", "pngout", "dis6502", "testing",
 ]

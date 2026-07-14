@@ -46,7 +46,7 @@ KNOWN_OPTIONAL = ("numpy", "pygame", "pytest", "cffi")
 # The FRONTEND RING: the viewer-facing modules inside the package that may use
 # the optional viewer dependencies (numpy + pygame).  ``import c64_re`` itself
 # must never pull them in — player.py keeps its imports lazy.
-FRONTEND_RING = {"player.py"}
+FRONTEND_RING = {"player.py", "audio_sink.py"}
 FRONTEND_ALLOWED = ("numpy", "pygame")
 
 

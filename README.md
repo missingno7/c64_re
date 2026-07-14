@@ -83,9 +83,11 @@ disk image. The human supplies the game, plays it, and records demos.
   `--no-replacements`, `--verify-hooks`, `--trace-hooks`) with the
   canonical hotkeys (F10 screenshot, F11 demo record, F12 snapshot).
   numpy/pygame stay lazy and are allowed ONLY here (lint-enforced).
-  `pngout.py` (stdlib PNG frame evidence), `dis6502.py` (disassembler over
-  the interpreter's own opcode table — never a second semantic model),
-  `testing.py` (stdlib test runner for constrained sandboxes).
+  `audio_sink.py` (observer-only SID synthesis — turns the captured register
+  stream into audible audio for the viewer; never touches game state, so
+  demos replay identically muted or not). `pngout.py` (stdlib PNG frame
+  evidence), `dis6502.py` (disassembler over the interpreter's own opcode
+  table — never a second semantic model), `testing.py` (stdlib test runner).
 - **Guardrail + evidence tools** — `tools/`: `lint.py` (stdlib-only core,
   frontend-ring boundary, adapter layer rules), `audit_layers.py` (pure
   layers never import the VM), `check_undefined_names.py`,
@@ -103,12 +105,9 @@ under scripted input).
 The dos_re machinery is now fully mirrored except for, in rough order of
 expected need:
 
-1. **Viewer audio** (`audio_sink.py` analogue) — an observer-only SID
-   synthesis backend for the viewer (the register stream is already
-   captured; synthesis is presentation and never touches game state).
-2. `overlay_menu.py` — the native product's settings widget
+1. `overlay_menu.py` — the native product's settings widget
    (POST-ENDGAME-gated; building it earlier violates the method).
-3. Misc tools as need arises: hotspot profiler, the static hook-oracle
+2. Misc tools as need arises: hotspot profiler, the static hook-oracle
    audit tool (`audit_hook_oracle.py` analogue), a VICE-snapshot importer
    (the `dosbox_savestate.py` analogue), the overnight-loop harness
    (template-side).

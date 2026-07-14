@@ -103,6 +103,9 @@ def build_parser(frontend: GameFrontend, description: str | None) -> argparse.Ar
                     default=frontend.default_joy_port)
     ap.add_argument("--scale", type=int, default=3)
     ap.add_argument("--fps", type=float, default=50.125)
+    ap.add_argument("--audio", action=argparse.BooleanOptionalAction, default=True,
+                    help="play the SID register stream through the speakers "
+                         "(observer-only; --no-audio to mute)")
     frontend.add_arguments(ap)
     return ap
 
@@ -248,6 +251,16 @@ def _run_viewer(frontend, rt, args, playback, recorder, trace_stats) -> int:
     artifacts = frontend.root / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
 
+    audio = None
+    if getattr(args, "audio", False):
+        from .audio_sink import SidAudioSink
+        audio = SidAudioSink(rt.machine.sid, fps=args.fps)
+        if audio.open():
+            print("audio: SID synthesis on (--no-audio to mute)")
+        else:
+            audio = None
+            print("audio: unavailable (no device/numpy) — running muted")
+
     set_joy = machine.set_joy1 if args.joy_port == 1 else machine.set_joy2
     joy_bits = 0
     paused = False
@@ -322,6 +335,8 @@ def _run_viewer(frontend, rt, args, playback, recorder, trace_stats) -> int:
                         running = False
             t0 = time.perf_counter()
             run_frames(rt, 1)
+            if audio is not None:
+                audio.pump()
             emu_ms = (time.perf_counter() - t0) * 1000
             behind = max(0.0, behind + emu_ms - 1000.0 / args.fps)
             if behind < 1000.0 / args.fps:
@@ -335,6 +350,8 @@ def _run_viewer(frontend, rt, args, playback, recorder, trace_stats) -> int:
                 behind = 0.0  # drop this render, never emulation frames
         clock.tick(args.fps)
 
+    if audio is not None:
+        audio.close()
     if recorder is not None and recorder.active:
         out = recorder.stop(boundary=vic.frame)
         print(f"demo saved -> {out} ({recorder.event_count} events)")
