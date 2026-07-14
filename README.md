@@ -49,15 +49,25 @@ disk image. The human supplies the game, plays it, and records demos.
   divergence.
 - **The automatic lifter** — `lift/`: static decode over the interpreter's
   own opcode table (never a second semantic model), function-region
-  discovery with structured refusals (indirect jump, BRK, mid-instruction
-  target, budget, no-exit), and an emitter producing literal
+  discovery with structured refusals (indirect jump, BRK, budget, no-exit,
+  plus two idiom-aware ones below), and an emitter producing literal
   per-instruction Python hooks — interpreter-helper reuse, exact cycle
   ticks, fail-loud SMC entry guard, `emulate_call` composition for JSR
-  dependencies. `tools/liftgen.py` (census + emit) and
-  `tools/liftverify.py` (in-situ install + per-call oracle verification +
-  the `LiftManifest` proof ledger). Proven on Stix: 41/76 census
-  candidates liftable; 6 gameplay-hot routines ORACLE_PASSING with 781
-  verified calls, 0 divergences, under `strict_cycles`.
+  dependencies. Two legal, idiomatic 6502 patterns get first-class
+  treatment rather than a blanket refusal: **overlapping instructions**
+  (the BIT-skip trick, `$2C`/`$24` swallowing the next op so a branch lands
+  mid-instruction — allowed; `scan.overlaps` counts them) and **non-local
+  returns** (a routine's `PLA`/`PLP` count exceeds its own `PHA`/`PHP`
+  before an RTS, meaning it cascades back past its own caller — refused as
+  `nonlocal_return`, with direct callers refused one level up via
+  `refuse_unsafe_callers` as `calls_nonlocal_return`, since callers further
+  up compose correctly once the unsafe pair is left uninstalled).
+  `tools/liftgen.py` (census + emit) and `tools/liftverify.py` (in-situ
+  install + per-call oracle verification + the `LiftManifest` proof
+  ledger). Proven on Stix: a full-game demo replay lifted 39 routines to
+  ORACLE_PASSING (1538 verified calls, 0 unexpected divergences —
+  one true self-modified-code spot correctly caught) with the census at
+  100% liftable on some runs.
 - **The frame oracle** — `frame_verify.py`: lockstep-step a pure-ASM
   reference and a hooked/native candidate to frame boundaries (VIC frame
   counter, or adapter-declared boundary PCs), diff rendered frames +

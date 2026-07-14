@@ -9,12 +9,16 @@ irrelevant (dos_re's proven design).
 Refusals are structured and honest — a refused function is simply not
 liftable *yet*, never lifted wrong:
 
-- ``jmp_ind``      — dynamic successor (jump tables need recovery, not lifting)
-- ``brk``          — software-interrupt convention in the region
-- ``bad_opcode``   — JAM/unstable/unknown byte reached
-- ``budget``       — region exceeded ``max_instructions`` (runaway trace)
-- ``no_exit``      — no RTS/RTI reachable (an eternal loop is a driver seam,
-                     not a hookable routine)
+- ``jmp_ind``       — dynamic successor (jump tables need recovery, not lifting)
+- ``brk``           — software-interrupt convention in the region
+- ``bad_opcode``    — JAM/unstable/unknown byte reached
+- ``budget``        — region exceeded ``max_instructions`` (runaway trace)
+- ``no_exit``       — no RTS/RTI reachable (an eternal loop is a driver seam,
+                      not a hookable routine)
+- ``nonlocal_return`` — an ``RTS`` pops more bytes than this function itself
+                      pushed (see below): it returns past its own caller.
+- ``calls_nonlocal_return`` — this function JSRs to one already refused as
+                      ``nonlocal_return`` (see :func:`refuse_unsafe_callers`).
 
 Overlapping instructions are NOT a refusal: the 6502 BIT-skip idiom
 (``$2C``/``$24`` swallowing the next op, with a branch landing on the
@@ -23,6 +27,27 @@ point.  ``scan_function`` allows a byte to be part of more than one decoded
 instruction; the emitter dispatches each by its own start PC and the
 differential oracle proves the result.  ``scan.overlaps`` counts how many
 instructions reused another's bytes (0 for ordinary code).
+
+**The non-local return idiom** (another legitimate, idiomatic 6502 trick;
+found in Stix's collision-abort routine, $7166): a function pops a return
+address it never pushed — typically ``PLA; PLA`` discarding the word its
+own caller's JSR pushed — so its own eventual RTS lands not in its caller,
+but in the *caller's caller*.  On real hardware this "cascading return" is
+free: RTS just uses whatever is on top of the stack.  It is NOT safe to
+lift as an independently hookable unit, though: :mod:`lift.runtime`'s
+``emulate_call`` wraps every JSR in a nested envelope that waits for a
+*specific* return PC and stack depth, and a callee that skips past its
+caller's envelope makes that wait hang forever.  ``scan_function`` tracks
+each function's own PHA/PHP (+1) vs PLA/PLP (-1) balance along every path
+(JSR is depth-neutral locally — the callee's own RTS is assumed to consume
+its own pushed return address); an RTS reached at a negative local depth
+means this function is popping bytes it never pushed, and is refused.
+The refusal is inherited exactly one level up by :func:`refuse_unsafe_callers`:
+a function that JSRs to a ``nonlocal_return`` target is *also* unsafe to
+lift standalone (its own emitted ``emulate_call`` for that JSR is the one
+that hangs) — but functions further up the call chain are unaffected,
+because once the unsafe callee is left uninstalled, plain interpretation
+handles the whole skip correctly with no bookkeeping to violate.
 """
 from __future__ import annotations
 
@@ -62,6 +87,14 @@ class FunctionScan:
         return sum(hi - lo for lo, hi in self.byte_ranges)
 
 
+# Local PHA/PHP (+1) / PLA/PLP (-1) stack-depth effect, tracked relative to
+# entry (0), to catch the non-local-return idiom.  JSR/RTS/RTI are excluded:
+# a normal call is depth-neutral locally (the callee's own RTS consumes the
+# return address it pushed), and RTI's implicit P+PC pop is the hardware
+# interrupt-return convention, not a local imbalance to flag.
+_STACK_EFFECT = {"PHA": 1, "PHP": 1, "PLA": -1, "PLP": -1}
+
+
 def scan_function(read, entry: int, *, max_instructions: int = 768):
     """Discover the region.  ``read(addr)`` supplies the static bytes the
     function is expected to run as (typically the live RAM at lift time).
@@ -69,11 +102,11 @@ def scan_function(read, entry: int, *, max_instructions: int = 768):
     entry &= 0xFFFF
     scan = FunctionScan(entry=entry)
     scan.block_starts.add(entry)
-    work = [entry]
+    work = [(entry, 0)]  # (pc, local stack depth relative to entry)
     covered: dict[int, int] = {}  # every byte pc -> owning insn pc
 
     while work:
-        pc = work.pop()
+        pc, depth = work.pop()
         if pc in scan.insns:
             continue
         if len(scan.insns) >= max_instructions:
@@ -103,22 +136,30 @@ def scan_function(read, entry: int, *, max_instructions: int = 768):
             covered[b & 0xFFFF] = pc
         scan.insns[pc] = insn
 
+        depth = depth + _STACK_EFFECT.get(insn.mnemonic, 0)
         nxt = (pc + insn.size) & 0xFFFF
         if insn.flow == SEQ:
-            work.append(nxt)
+            work.append((nxt, depth))
         elif insn.flow == CALL:
             scan.calls.add(insn.target)
-            work.append(nxt)
+            work.append((nxt, depth))
         elif insn.flow == BRANCH:
             scan.block_starts.add(insn.target)
             scan.block_starts.add(nxt)
-            work.append(insn.target)
-            work.append(nxt)
+            work.append((insn.target, depth))
+            work.append((nxt, depth))
         elif insn.flow == JMP_ABS:
             scan.block_starts.add(insn.target)
-            work.append(insn.target)
+            work.append((insn.target, depth))
         elif insn.flow == RET:
             scan.exits.add(pc)
+            if insn.mnemonic == "RTS" and depth < 0:
+                return Refusal(
+                    entry, "nonlocal_return",
+                    f"RTS at ${pc:04X} pops {-depth} more byte(s) than this "
+                    "function itself pushed — it returns past its own caller "
+                    "(the 6502 cascading-return idiom); unsafe to lift as an "
+                    "independently callable unit (see module docstring)")
 
     if not scan.exits:
         return Refusal(entry, "no_exit", "no RTS/RTI reachable from entry")
@@ -133,3 +174,31 @@ def scan_function(read, entry: int, *, max_instructions: int = 768):
         prev = b
     scan.byte_ranges.append((lo, prev + 1))
     return scan
+
+
+def refuse_unsafe_callers(scans: "dict[int, FunctionScan | Refusal]") -> "dict[int, Refusal]":
+    """Tier-2 refusal: a function that JSRs to a ``nonlocal_return`` target
+    is also unsafe to lift standalone — refuse it as ``calls_nonlocal_return``.
+
+    Takes a batch of already-computed per-address :func:`scan_function`
+    results (as a liftgen census naturally produces) and returns Refusals
+    for the *additional* addresses this catches; it does not modify
+    ``scans`` or re-scan anything.  Deliberately stops at one level: a
+    function calling one of THESE newly-refused functions is unaffected,
+    because once the unsafe callee is left uninstalled, plain interpretation
+    handles the whole non-local return correctly with no bookkeeping to
+    violate (see the module docstring's worked example).
+    """
+    nonlocal_return = {addr for addr, r in scans.items()
+                       if isinstance(r, Refusal) and r.reason == "nonlocal_return"}
+    out: dict[int, Refusal] = {}
+    for addr, r in scans.items():
+        if not isinstance(r, Refusal) and (r.calls & nonlocal_return):
+            hit = sorted(r.calls & nonlocal_return)[0]
+            out[addr] = Refusal(
+                addr, "calls_nonlocal_return",
+                f"JSRs to ${hit:04X}, which returns past ITS caller "
+                "(nonlocal_return) — this function's own emitted JSR wrapper "
+                "would hang waiting for a return that skips it; unsafe to "
+                "lift standalone (callers of this function are unaffected)")
+    return out

@@ -7,7 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c64_re.hooks import HookRegistry  # noqa: E402
-from c64_re.lift.cfg import scan_function  # noqa: E402
+from c64_re.lift.cfg import refuse_unsafe_callers, scan_function  # noqa: E402
 from c64_re.lift.emit import LiftRefused, lift_and_compile  # noqa: E402
 from c64_re.lift.manifest import LiftManifest, LiftRecord  # noqa: E402
 from c64_re.runtime import run_until  # noqa: E402
@@ -111,6 +111,55 @@ def test_scan_refuses_jam_and_brk():
 def test_scan_refuses_endless_loop():
     code = bytes((0x4C, 0x00, 0x40))  # JMP $4000 (self)
     assert scan_function(reader(code, 0x4000), 0x4000).reason == "no_exit"
+
+
+# ---- non-local return (cascading-return) idiom ------------------------------------
+# As found in Stix's $7166 (collision-abort): PLA PLA discards the return
+# address ITS OWN caller's JSR pushed, then the eventual RTS lands in the
+# caller's CALLER, not the immediate caller.  Legal on real hardware; unsafe
+# to wrap in the lifter's emulate_call (which waits for a specific PC+SP).
+#   4000 A9 00     LDA #$00
+#   4002 68        PLA
+#   4003 68        PLA
+#   4004 A9 05     LDA #$05
+#   4006 60        RTS
+NONLOCAL_RETURN_CODE = bytes((0xA9, 0x00, 0x68, 0x68, 0xA9, 0x05, 0x60))
+
+
+def test_scan_refuses_nonlocal_return():
+    scan = scan_function(reader(NONLOCAL_RETURN_CODE, 0x4000), 0x4000)
+    assert not scan and scan.reason == "nonlocal_return"
+
+
+def test_scan_allows_balanced_push_pop():
+    # PHA then PLA before RTS: net-zero, perfectly ordinary — must lift fine.
+    code = bytes((0x48, 0x68, 0x60))  # PHA / PLA / RTS
+    scan = scan_function(reader(code, 0x4000), 0x4000)
+    assert scan
+
+
+def test_refuse_unsafe_callers_flags_direct_caller_only():
+    # $4000 = the nonlocal_return leaf; $4010 JSRs it (unsafe, tier 2);
+    # $4020 JSRs $4010 (SAFE — one level up, per the module's design: once
+    # $4010 is left uninstalled, plain interpretation handles the skip).
+    leaf = NONLOCAL_RETURN_CODE
+    mid = bytes((0x20, 0x00, 0x40, 0x60))          # JSR $4000 / RTS
+    top = bytes((0x20, 0x10, 0x40, 0x60))          # JSR $4010 / RTS
+    blob = {0x4000: leaf, 0x4010: mid, 0x4020: top}
+
+    def read(addr):
+        for base, code in blob.items():
+            if base <= addr < base + len(code):
+                return code[addr - base]
+        return 0x02
+    scans = {addr: scan_function(read, addr) for addr in blob}
+    assert not scans[0x4000] and scans[0x4000].reason == "nonlocal_return"
+    assert scans[0x4010]  # tier-1 alone doesn't catch the direct caller
+    assert scans[0x4020]
+
+    extra = refuse_unsafe_callers(scans)
+    assert set(extra) == {0x4010}
+    assert extra[0x4010].reason == "calls_nonlocal_return"
 
 
 # ---- emit fidelity: lifted vs interpreted, full-state, via the oracle ------------
