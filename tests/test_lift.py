@@ -44,6 +44,59 @@ def test_scan_branch_and_loop():
     assert 0x4005 in scan.block_starts  # fall-through
 
 
+def test_scan_allows_bit_skip_overlap():
+    # The 6502 BIT-skip idiom (as in Stix $653C):
+    #   LDX $10 / BNE +3 / LDA #$14 / .byte $2C (BIT abs) / LDA #$02 / STA $11 / RTS
+    # BNE targets the LDA #$02 that the $2C swallows on fall-through.
+    #   4000 A6 10     LDX $10
+    #   4002 D0 03     BNE $4007
+    #   4004 A9 14     LDA #$14
+    #   4006 2C A9 02  BIT $02A9   <- $4007 (A9 02 = LDA #$02) is inside it
+    #   4009 85 11     STA $11
+    #   400B 60        RTS
+    code = bytes((0xA6, 0x10, 0xD0, 0x03, 0xA9, 0x14, 0x2C, 0xA9, 0x02,
+                  0x85, 0x11, 0x60))
+    scan = scan_function(reader(code, 0x4000), 0x4000)
+    assert scan, "BIT-skip overlap must lift, not refuse"
+    assert scan.overlaps >= 1
+    assert 0x4007 in scan.insns and 0x4006 in scan.insns  # both readings kept
+
+
+def test_bit_skip_overlap_lifts_and_matches_interpreter(tmp_path):
+    """Both entry paths of a BIT-skip idiom reproduce the interpreter exactly."""
+    from c64_re.cpu import CPU6502, CPUState
+    from c64_re.kernal import build_shim_basic, build_shim_chargen, build_shim_kernal
+    from c64_re.memory import Memory
+
+    code = bytes((0xA6, 0x10, 0xD0, 0x03, 0xA9, 0x14, 0x2C, 0xA9, 0x02,
+                  0x85, 0x11, 0x60))
+    for x10 in (0x00, 0x05):  # 0 => fall-through (STA #$14); nonzero => skip (STA #$02)
+        mem = Memory(basic_rom=build_shim_basic(), kernal_rom=build_shim_kernal(),
+                     char_rom=build_shim_chargen())
+        mem.ram[0x4000:0x4000 + len(code)] = code
+        mem.ram[0x10] = x10
+        interp = CPU6502(mem, CPUState(pc=0x4000, sp=0xFD))
+        interp.push(0x12)  # RTS returns to $1233+1 = $1234
+        interp.push(0x33)
+        for _ in range(8):
+            if interp.s.pc == 0x1234:
+                break
+            interp.step()
+        expected = mem.ram[0x11]
+
+        hook, source, scan = lift_and_compile(reader(code, 0x4000), 0x4000)
+        assert "BIT" in source
+        mem2 = Memory(basic_rom=build_shim_basic(), kernal_rom=build_shim_kernal(),
+                      char_rom=build_shim_chargen())
+        mem2.ram[0x4000:0x4000 + len(code)] = code
+        mem2.ram[0x10] = x10
+        cpu2 = CPU6502(mem2, CPUState(pc=0x4000, sp=0xFD))
+        cpu2.push(0x12)
+        cpu2.push(0x33)
+        hook(cpu2)
+        assert mem2.ram[0x11] == expected, f"x10={x10}: hook {mem2.ram[0x11]:#x} != {expected:#x}"
+
+
 def test_scan_refuses_indirect_jmp():
     code = bytes((0x6C, 0x00, 0x30))  # JMP ($3000)
     scan = scan_function(reader(code, 0x4000), 0x4000)

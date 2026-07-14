@@ -12,11 +12,17 @@ liftable *yet*, never lifted wrong:
 - ``jmp_ind``      — dynamic successor (jump tables need recovery, not lifting)
 - ``brk``          — software-interrupt convention in the region
 - ``bad_opcode``   — JAM/unstable/unknown byte reached
-- ``mid_insn``     — a control-flow target lands inside another instruction
-                     (usually means SMC or data-in-code: refuse)
 - ``budget``       — region exceeded ``max_instructions`` (runaway trace)
 - ``no_exit``      — no RTS/RTI reachable (an eternal loop is a driver seam,
                      not a hookable routine)
+
+Overlapping instructions are NOT a refusal: the 6502 BIT-skip idiom
+(``$2C``/``$24`` swallowing the next op, with a branch landing on the
+swallowed instruction) makes the same bytes decode two ways by entry
+point.  ``scan_function`` allows a byte to be part of more than one decoded
+instruction; the emitter dispatches each by its own start PC and the
+differential oracle proves the result.  ``scan.overlaps`` counts how many
+instructions reused another's bytes (0 for ordinary code).
 """
 from __future__ import annotations
 
@@ -45,6 +51,8 @@ class FunctionScan:
     exits: set[int] = field(default_factory=set)            # PCs of RTS/RTI
     calls: set[int] = field(default_factory=set)            # JSR dependency targets
     byte_ranges: list[tuple[int, int]] = field(default_factory=list)  # for SMC guard
+    overlaps: int = 0  # count of instructions that reuse a byte of another
+    #                    (the 6502 BIT-skip idiom: $2C/$24 swallowing the next op)
 
     def __bool__(self) -> bool:
         return True
@@ -68,9 +76,6 @@ def scan_function(read, entry: int, *, max_instructions: int = 768):
         pc = work.pop()
         if pc in scan.insns:
             continue
-        if pc in covered and covered[pc] != pc:
-            return Refusal(entry, "mid_insn",
-                           f"${pc:04X} is inside the instruction at ${covered[pc]:04X}")
         if len(scan.insns) >= max_instructions:
             return Refusal(entry, "budget",
                            f"region exceeded {max_instructions} instructions")
@@ -82,12 +87,19 @@ def scan_function(read, entry: int, *, max_instructions: int = 768):
             return Refusal(entry, "brk", f"BRK at ${pc:04X}")
         if insn.flow == JMP_IND:
             return Refusal(entry, "jmp_ind", f"JMP (indirect) at ${pc:04X}")
-        # overlap check: none of this insn's bytes may belong to another insn
+        # Overlapping instructions are LEGAL on the 6502 and idiomatic: the
+        # BIT-skip trick uses a bare $2C (BIT abs) / $24 (BIT zp) opcode to
+        # swallow the next 2- or 1-byte instruction, and a branch lands on
+        # that swallowed instruction to "un-skip" it — so the same bytes
+        # decode two ways depending on the entry point.  We allow a byte to
+        # belong to more than one decoded instruction: each is keyed by its
+        # own start PC and dispatched independently by the emitter, the SMC
+        # entry guard still covers the union of all decoded bytes (a
+        # runtime-patched variant is refused at call time), and the
+        # differential oracle is the final proof the overlap was read right.
+        if any(covered.get(b & 0xFFFF, pc) != pc for b in range(pc, pc + insn.size)):
+            scan.overlaps += 1
         for b in range(pc, pc + insn.size):
-            prior = covered.get(b & 0xFFFF)
-            if prior is not None and prior != pc:
-                return Refusal(entry, "mid_insn",
-                               f"instruction at ${pc:04X} overlaps ${prior:04X}")
             covered[b & 0xFFFF] = pc
         scan.insns[pc] = insn
 
