@@ -1,0 +1,170 @@
+"""Lifter tests: decode/cfg refusals, emit fidelity, oracle-verified installs."""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from c64_re.hooks import HookRegistry  # noqa: E402
+from c64_re.lift.cfg import scan_function  # noqa: E402
+from c64_re.lift.emit import LiftRefused, lift_and_compile  # noqa: E402
+from c64_re.lift.manifest import LiftManifest, LiftRecord  # noqa: E402
+from c64_re.runtime import run_until  # noqa: E402
+from c64_re.verification import install_live_verifier  # noqa: E402
+
+from test_machine import basic_stub, make_d64_with_prg  # noqa: E402
+from test_verification import build_rt  # noqa: E402
+
+
+def reader(data: bytes, base: int):
+    def read(addr):
+        a = (addr - base) & 0xFFFF
+        return data[a] if 0 <= a < len(data) else 0x02  # JAM outside
+    return read
+
+
+# ---- cfg / refusals -----------------------------------------------------------
+def test_scan_simple_leaf():
+    # LDA #$01 / CLC / ADC $FB / STA $FB / RTS
+    code = bytes((0xA9, 0x01, 0x18, 0x65, 0xFB, 0x85, 0xFB, 0x60))
+    scan = scan_function(reader(code, 0x4000), 0x4000)
+    assert scan
+    assert len(scan.insns) == 5
+    assert scan.exits == {0x4007}
+    assert scan.byte_ranges == [(0x4000, 0x4008)]
+
+
+def test_scan_branch_and_loop():
+    # LDX #$05 / loop: DEX / BNE loop / RTS
+    code = bytes((0xA2, 0x05, 0xCA, 0xD0, 0xFD, 0x60))
+    scan = scan_function(reader(code, 0x4000), 0x4000)
+    assert scan
+    assert 0x4002 in scan.block_starts  # branch target
+    assert 0x4005 in scan.block_starts  # fall-through
+
+
+def test_scan_refuses_indirect_jmp():
+    code = bytes((0x6C, 0x00, 0x30))  # JMP ($3000)
+    scan = scan_function(reader(code, 0x4000), 0x4000)
+    assert not scan and scan.reason == "jmp_ind"
+
+
+def test_scan_refuses_jam_and_brk():
+    assert scan_function(reader(bytes((0x02,)), 0x4000), 0x4000).reason == "bad_opcode"
+    assert scan_function(reader(bytes((0x00,)), 0x4000), 0x4000).reason == "brk"
+
+
+def test_scan_refuses_endless_loop():
+    code = bytes((0x4C, 0x00, 0x40))  # JMP $4000 (self)
+    assert scan_function(reader(code, 0x4000), 0x4000).reason == "no_exit"
+
+
+# ---- emit fidelity: lifted vs interpreted, full-state, via the oracle ------------
+# A deliberately gnarly routine exercising branches, RMW on I/O, page-cross
+# indexing, decimal mode, stack ops, and a JSR to a sub-leaf:
+#   $0900: LDX #$04
+#   $0902: loop: LDA $C0FE,X   (page-crossing for X>=2)
+#   $0905: SED / CLC / ADC #$25 / CLD
+#   $090A: STA $C100,X
+#   $090D: JSR $0920
+#   $0910: DEX / BPL loop
+#   $0912: INC $D020
+#   $0915: PHP / PLA / STA $FB
+#   $0919: RTS
+GNARLY = bytes((
+    0xA2, 0x04,
+    0xBD, 0xFE, 0xC0,
+    0xF8, 0x18, 0x69, 0x25, 0xD8,
+    0x9D, 0x00, 0xC1,
+    0x20, 0x20, 0x09,
+    0xCA, 0x10, 0xEF,
+    0xEE, 0x20, 0xD0,
+    0x08, 0x68, 0x85, 0xFB,
+    0x60,
+))
+SUB = bytes((0xE6, 0xFC, 0x60))  # INC $FC / RTS
+GNARLY_ADDR = 0x0900
+SUB_ADDR = 0x0920
+# main loop calls the gnarly routine forever:  JSR $0900 / JMP $080D
+MAIN = bytes((0x20, 0x00, 0x09, 0x4C, 0x0D, 0x08))
+
+
+def build_gnarly_rt(tmp_path):
+    rt = build_rt(tmp_path, MAIN)
+    rt.mem.ram[GNARLY_ADDR:GNARLY_ADDR + len(GNARLY)] = GNARLY
+    rt.mem.ram[SUB_ADDR:SUB_ADDR + len(SUB)] = SUB
+    for i in range(8):
+        rt.mem.ram[0xC0FE + i] = 0x11 * (i + 1)
+    return rt
+
+
+def test_lifted_hook_passes_oracle(tmp_path):
+    rt = build_gnarly_rt(tmp_path)
+    hook, source, scan = lift_and_compile(rt.mem.rb, GNARLY_ADDR)
+    assert "SED" in source and "emulate_call" in source  # literal artifact
+    reg = HookRegistry()
+    reg.replace(GNARLY_ADDR, "lifted_gnarly")(hook)
+    reg.install(rt.cpu)
+    # strict_cycles: a lifted hook must reproduce the interpreter's exact
+    # cycle model, not just its end state
+    oracle = install_live_verifier(rt, strict_cycles=True)
+    # each gnarly call runs the sub-leaf 5 times (X = 4..0)
+    run_until(rt, lambda r: r.mem.ram[0xFC] >= 25)
+    assert oracle.stats.verified >= 5
+    assert not oracle.stats.diverged
+
+
+def test_lifted_hook_matches_pure_run_exactly(tmp_path):
+    """Lifted+verified run vs never-hooked run: identical at a program point,
+    including cycle counts (the emitter's cycle model is the interpreter's)."""
+    def at_boundary(r):
+        return r.cpu.s.pc == 0x080D and r.mem.ram[0xFC] >= 6
+
+    pure = build_gnarly_rt(tmp_path)
+    run_until(pure, at_boundary)
+
+    lifted = build_gnarly_rt(tmp_path)
+    hook, _, _ = lift_and_compile(lifted.mem.rb, GNARLY_ADDR)
+    reg = HookRegistry()
+    reg.replace(GNARLY_ADDR, "lifted_gnarly")(hook)
+    reg.install(lifted.cpu)
+    run_until(lifted, at_boundary)
+
+    assert bytes(lifted.mem.ram) == bytes(pure.mem.ram)
+    assert lifted.cpu.s.as_dict() == pure.cpu.s.as_dict()
+    assert lifted.cpu.cycle_count == pure.cpu.cycle_count
+    assert lifted.machine.vic.raster == pure.machine.vic.raster
+    assert bytes(lifted.machine.vic.regs) == bytes(pure.machine.vic.regs)
+
+
+def test_smc_guard_refuses_patched_code(tmp_path):
+    rt = build_gnarly_rt(tmp_path)
+    hook, _, _ = lift_and_compile(rt.mem.rb, GNARLY_ADDR)
+    rt.mem.ram[GNARLY_ADDR + 7] = 0x26  # patch the ADC operand ($25 -> $26)
+    with pytest.raises(RuntimeError) as ei:
+        hook(rt.cpu)
+    assert "runtime-patched" in str(ei.value)
+
+
+def test_lift_refusal_is_structured(tmp_path):
+    rt = build_gnarly_rt(tmp_path)
+    rt.mem.ram[0x0930:0x0933] = bytes((0x6C, 0x00, 0x30))  # JMP ($3000)
+    with pytest.raises(LiftRefused) as ei:
+        lift_and_compile(rt.mem.rb, 0x0930)
+    assert ei.value.refusal.reason == "jmp_ind"
+
+
+def test_manifest_roundtrip(tmp_path):
+    m = LiftManifest()
+    m.update(LiftRecord(entry=0x0900, name="lifted_0900", status="ORACLE_PASSING",
+                        size_bytes=26, instructions=15, calls_seen=6,
+                        verified_calls=6))
+    m.update(LiftRecord(entry=0x0930, name="refused_0930", status="REFUSED",
+                        refusal_reason="jmp_ind"))
+    p = tmp_path / "lift_manifest.json"
+    m.save(p)
+    m2 = LiftManifest.load(p)
+    assert m2.get(0x0900).verified_calls == 6
+    assert m2.get(0x0930).status == "REFUSED"
+    assert "ORACLE_PASSING=1" in m2.summary()

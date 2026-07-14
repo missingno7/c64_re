@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# virtualenvs
+.venv/
+venv/
+
+# machine snapshots (may carry a game's RAM image — never commit)
+*.c64snap
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+[project]
+name = "c64_re"
+version = "0.1.0"
+description = "Oracle-driven Commodore 64 game recovery framework (dos_re sibling)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+viewer = ["numpy", "pygame"]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
