@@ -65,6 +65,25 @@ def _latest_demo(root: Path, name: str) -> Path:
     return demos[-1]
 
 
+def test_f11_records_without_record_demo_flag(tmp_path):
+    # No --record-demo on the command line: F11 alone must start recording
+    # (default name = the game name) and F11 again saves it (pre2 convention).
+    fe = make_frontend(tmp_path, boot_frames=3)
+    _feed_after(0.5, [
+        (0.2, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F11)),   # start
+        (0.2, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP)),
+        (0.2, pygame.event.Event(pygame.KEYUP, key=pygame.K_UP)),
+        (0.2, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F11)),   # stop
+        (0.2, pygame.event.Event(pygame.QUIT)),
+    ])
+    rc = player.main(fe, [])  # <-- nothing on the command line
+    assert rc == 0
+    demo = _latest_demo(tmp_path, "spin")  # default name = frontend.name
+    m = json.loads((demo / "input_demo.json").read_text())
+    assert m["status"] == "complete"
+    assert m["event_count"] >= 1
+
+
 def test_record_demo_is_cold_start_from_power_on(tmp_path):
     # boot_to_start would run 999 frames — --record-demo must SKIP it and
     # record a cold-start demo from a fresh power-on runtime.

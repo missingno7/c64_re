@@ -21,7 +21,10 @@ CLI surface:
 
 Viewer hotkeys (the template convention): F10 screenshot, F11 demo-record
 toggle, F12 snapshot, F9 pause.  Arrows + Right-Ctrl = joystick; the C64
-keyboard is mapped 1:1 for letters/digits and common specials.
+keyboard is mapped 1:1 for letters/digits and common specials.  F11 works at
+any time with no flags — it starts a timestamped recording (named after the
+game) and stops/saves on the next press; ``--record-demo`` just auto-starts
+one at launch.
 
 Determinism contract: host input is applied only at frame boundaries,
 through the same machine API demos use, and recording captures exactly
@@ -87,9 +90,9 @@ def build_parser(frontend: GameFrontend, description: str | None) -> argparse.Ar
     ap.add_argument("--snapshot", default="", help="resume a .c64snap")
     ap.add_argument("--save-snapshot", default="", help="write snapshot at exit")
     ap.add_argument("--record-demo", action="store_true",
-                    help="record a cold-start input demo: the whole session "
-                         "from power-on (you drive the menus; starts "
-                         "immediately, F11 stops/restarts, close to save). "
+                    help="auto-start a cold-start demo at launch (whole session "
+                         "from power-on; you drive the menus, close to save). "
+                         "Optional: F11 records at any time without this flag. "
                          "With --snapshot it records snapshot-anchored instead.")
     ap.add_argument("--demo-name", default="", metavar="NAME",
                     help="name for the recorded demo (default: the game name)")
@@ -288,14 +291,24 @@ def _run_viewer(frontend, rt, args, playback, recorder, trace_stats) -> int:
                     save_frame_png(path, vic.render_frame(border=True))
                     print(f"screenshot -> {path}")
                 elif ev.key == pygame.K_F11 and down:
-                    if recorder is None:
-                        print("no --record-demo NAME armed")
-                    elif not recorder.active:
-                        out = recorder.start(rt)
-                        print(f"demo recording -> {out}")
-                    else:
+                    # F11 toggles recording at any time — no --record-demo
+                    # needed.  The name defaults to the game name; the demo
+                    # directory is timestamped (pre2 convention).
+                    if recorder is not None and recorder.active:
                         out = recorder.stop(boundary=vic.frame)
                         print(f"demo saved -> {out} ({recorder.event_count} events)")
+                    else:
+                        if recorder is None:
+                            from .input_demo import InputDemoRecorder
+                            recorder = InputDemoRecorder(
+                                root=frontend.root / "artifacts" / "demos",
+                                name=args.demo_name or frontend.name.lower().replace(" ", "_"),
+                                metadata=frontend.demo_metadata(rt, args),
+                            )
+                        fresh = vic.frame == 0 and rt.cpu.instr_count == 0
+                        out = recorder.start(rt, write_start_snapshot=not fresh)
+                        kind = "cold-start" if fresh else "snapshot-anchored"
+                        print(f"[REC] recording {kind} demo {recorder.name!r} -> {out.name}")
                 elif ev.key == pygame.K_F12 and down:
                     snaps += 1
                     path = artifacts / f"snapshot_{snaps:03d}.c64snap"
